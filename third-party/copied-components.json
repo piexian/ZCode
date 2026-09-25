@@ -250,5 +250,17 @@
     "license": "MIT",
     "scope": "Vendored React/Next.js guidance and local adaptations; local README preserves Shu Ding / Vercel attribution.",
     "reviewRequired": "Pinned upstream README and skill declare MIT, but a complete original copyright/license notice has not been obtained."
+  },
+  {
+    "id": "zcode-cua-plugin",
+    "referenceRevision": "ZCode-3.14.3-windows-x64",
+    "source": "ZCode 3.14.3 Windows x64 distribution, resources/glm/packages/zcode-cua-plugin (.zcode-plugin/plugin.json declares license MIT, author Z.ai)",
+    "file": "third-party/upstream/c062d6b1760da9c2dbea8610c1ac5913c034220ddcf2f9066f7fcecba3142e0d.txt",
+    "sha256": "c062d6b1760da9c2dbea8610c1ac5913c034220ddcf2f9066f7fcecba3142e0d",
+    "importRevision": "0.6.3",
+    "provenance": "Official Computer Use plugin payload extracted from the locally held ZCode 3.14.3 Windows x64 distribution and vendored verbatim; no local edits to the skill, reference doc or SDK client.",
+    "roots": ["apps/zcode-cli/packages/zcode-cua-plugin"],
+    "scope": "Vendored plugin payload only (skill, reference documentation, SDK client, plugin manifest). Local runtime behavior lives in @zcode/zcode-cua and is not covered by this attribution.",
+    "license": "MIT"
   }
 ]

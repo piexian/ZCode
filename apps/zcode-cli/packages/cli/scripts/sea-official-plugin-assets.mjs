@@ -43,6 +43,23 @@ export const officialSeaPlugins = [
     // 导致发布产物不 seed browser-use，进而无法装配宿主 node_repl MCP。
     version: "0.5.1",
   },
+  {
+    // Computer Use 插件：模型侧 skill、参考文档与 SDK client 同一发布单元。
+    // 执行能力由 @zcode/zcode-cua 与 node_repl 宿主提供，这里只带插件自身资产；
+    // 缺失会让 computer-use 插件在 SEA 产物里 seed 失败。
+    marketplace: "zcode-plugins-official",
+    name: "computer-use",
+    packageName: "@zcode/zcode-cua-plugin",
+    requiresRuntime: true,
+    requiredRuntimePaths: [
+      ".zcode-plugin/plugin.json",
+      "docs/computer-use.md",
+      "scripts/computer-use-client.mjs",
+      "skills/computer-use/SKILL.md",
+    ],
+    rootPath: join("packages", "zcode-cua-plugin"),
+    version: "0.6.3",
+  },
 ];
 
 export const collectSeaOfficialPluginAssets = async ({

@@ -112,6 +112,22 @@ const officialPluginPackages = [
     runtimeBuildScript: "scripts/build.mjs",
     stagedPath: "packages/node-repl-host",
   },
+  {
+    // computer-use 插件：模型侧 Computer Use 面（skill + 参考文档 + SDK client）。
+    // 执行能力归 @zcode/zcode-cua 与共享 node_repl 宿主，这里只带插件自身的资产；
+    // 少了它，computer-use 插件 seed 会因为 requiredSeedPaths 缺失而整段不可用。
+    packageName: "@zcode/zcode-cua-plugin",
+    relativePath: "apps/zcode-cli/packages/zcode-cua-plugin",
+    requiresRuntime: true,
+    requiredRuntimePaths: [
+      ".zcode-plugin/plugin.json",
+      "docs/computer-use.md",
+      "scripts/computer-use-client.mjs",
+      "skills/computer-use/SKILL.md",
+    ],
+    runtimeBuildScript: "scripts/check-sdk.mjs",
+    stagedPath: "packages/zcode-cua-plugin",
+  },
 ];
 // 随 CLI 内置的技能包（不是插件）：bootstrap 的 resolveBundledSkillRoots 沿官方插件同款候选目录
 // 在 zcode.cjs 旁找 packages/bundled-skills 并原地读取。漏 stage 它，桌面包的 /workflow 会展开成
