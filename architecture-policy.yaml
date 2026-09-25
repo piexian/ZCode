@@ -8,6 +8,9 @@ modules:
   - id: shared
     roots: [packages/shared/src]
     managed: false
+  - id: zcode-cua
+    roots: [packages/zcode-cua]
+    managed: false
   - id: provider
     roots: [packages/provider/src]
     managed: false
