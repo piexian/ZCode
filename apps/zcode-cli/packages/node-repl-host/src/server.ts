@@ -1,6 +1,13 @@
 /* eslint-disable max-lines -- shared node_repl host 的 worker、CUA bridge 和生命周期必须保持同一边界。 */
 import { resolve } from "node:path";
-import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
+import {
+  isMainThread,
+  MessageChannel,
+  parentPort,
+  Worker,
+  workerData,
+  type MessagePort,
+} from "node:worker_threads";
 import { INVALID_PARAMS, Server, type Tool } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { JsInputJsonSchema } from "@zcode/contracts/tools/node-repl";
@@ -19,10 +26,14 @@ import { z } from "zod";
 import { createBrowserBridgeGlobals, type ActiveNodeReplCall } from "./browser-bridge.js";
 import {
   createComputerUseBridgeGlobals,
+  createNodeReplCuaCapabilityClient,
+  NODE_REPL_CUA_CAPABILITY_PORT,
+  NODE_REPL_CUA_CAPABILITY_READY,
   type ActiveCuaNodeReplCall,
+  type NodeReplCuaCapabilityClient,
   type NodeReplCuaBrokerConnection,
 } from "./cua-bridge.js";
-import { createNodeReplCuaBroker, type NodeReplCuaBroker } from "./cua-broker.js";
+import { serveNodeReplCuaCapabilityPort } from "./cua-broker.js";
 import {
   isDirectMcpEntrypoint,
   installNodeReplProcessGuards,
@@ -39,6 +50,31 @@ import {
 const MAX_SYNC_TIMEOUT_MS = 120_000;
 const UNTRUSTED_SESSION_KEY = "__unscoped__";
 const WORKER_KIND = "zcode-node-repl-call";
+/**
+ * Worker 环境里必须剔除的 CUA broker 凭据，来源见 packages/shared/src/runtimeEnv.ts。
+ * Browser bridge 仍需要自己的 broker 凭据，因此这里只删 CUA 凭据键，不清空整个环境。
+ * `ZCODE_CUA_PLUGIN_ROOT` 是 CUA 文档根路径（不是凭据），故意保留。
+ */
+const CUA_WORKER_ENV_DENYLIST = [
+  "ZCODE_CUA_PERMISSION_BROKER_SOCKET",
+  "ZCODE_CUA_PERMISSION_BROKER_TOKEN",
+  "ZCODE_CUA_PERMISSION_BROKER_REFRESH_MARKER",
+  "ZCODE_CUA_PLUGIN_AUTHORITY",
+  "ZCODE_CUA_HELPER_ADDON",
+  "ZCODE_CUA_HELPER_INSTALL_VARIANT",
+  "ZCODE_CUA_LAUNCHER_PID",
+  "ZCODE_CUA_LAUNCHER_BUNDLE_ID",
+  "ZCODE_CUA_HELPER_TEAM_ID",
+  "ZCODE_CUA_HELPER_BUILD_ID",
+  "ZCODE_CUA_PERMISSION_BROKER_UNAVAILABLE",
+] as const;
+
+function createWorkerEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of CUA_WORKER_ENV_DENYLIST) delete env[key];
+  return env;
+}
+
 export const NODE_REPL_MCP_PROCESS_TITLE = "zcode-node-repl-mcp";
 const pluginRoot = process.env.ZCODE_PLUGIN_ROOT ?? process.cwd();
 // CUA 与 Browser Use 共用 node_repl host，但文档和 native 依赖必须按领域隔离；
@@ -87,6 +123,12 @@ export interface NodeReplExecuteInput {
   requestMeta: NodeReplRequestMeta;
   signal: AbortSignal;
   syncTimeoutMs: number;
+  /**
+   * private capability 通道。生产 Worker 路径只走它，Worker 内拿不到 broker 凭据。
+   * Worker executor 自己的 bridge 端点由它建立。
+   */
+  cuaCapability?: NodeReplCuaCapabilityClient;
+  /** 同进程嵌入与旧 bundle 的兼容通道；生产 Worker 路径不再传。 */
   cuaBroker?: NodeReplCuaBrokerConnection;
 }
 
@@ -102,7 +144,6 @@ interface WorkerCallData {
   kind: typeof WORKER_KIND;
   requestMeta: NodeReplRequestMeta;
   syncTimeoutMs: number;
-  cuaBroker?: NodeReplCuaBrokerConnection;
 }
 
 export function setNodeReplMcpProcessTitle(target: { title: string } = process): void {
@@ -129,6 +170,7 @@ export function createInProcessNodeReplExecutor(): NodeReplExecutor {
             session: () => session,
           }),
           ...createComputerUseBridgeGlobals({
+            capability: input.cuaCapability,
             broker: input.cuaBroker,
             generation,
             getActiveCall: () => activeCuaCall,
@@ -165,12 +207,10 @@ export function createInProcessNodeReplExecutor(): NodeReplExecutor {
 export function createNodeReplMcpRuntime(
   input: { executeJs?: NodeReplExecutor; cuaRuntime?: ComputerUseRuntime } = {},
 ): NodeReplMcpRuntime {
-  const executeJs = input.executeJs ?? executeJsInWorker;
-  const cuaRuntime =
-    input.cuaRuntime ?? captureComputerUseRuntimeFromEnvironment();
-  const cuaBroker = cuaRuntime
-    ? createNodeReplCuaBroker({ runtime: cuaRuntime, platform: process.platform })
-    : undefined;
+  const cuaRuntime = input.cuaRuntime ?? captureComputerUseRuntimeFromEnvironment();
+  const executeJs =
+    input.executeJs ??
+    ((execInput: NodeReplExecuteInput) => executeJsInWorker(execInput, cuaRuntime));
   const queues = new Map<string, Promise<void>>();
   const activeCalls = new Set<AbortController>();
   let disposed = false;
@@ -226,7 +266,6 @@ export function createNodeReplMcpRuntime(
             requestMeta: callMeta,
             signal,
             syncTimeoutMs: Math.min(timeoutMs, MAX_SYNC_TIMEOUT_MS),
-            cuaBroker: cuaBroker?.connection,
           });
           return toMcpRunResult(run);
         } finally {
@@ -244,27 +283,47 @@ export function createNodeReplMcpRuntime(
       for (const controller of activeCalls) controller.abort();
       activeCalls.clear();
       queues.clear();
-      void cuaBroker?.close();
       void cuaRuntime?.dispose();
     },
   };
 }
 
-async function executeJsInWorker(input: NodeReplExecuteInput): Promise<NodeReplRunResult> {
+/**
+ * 生产 Worker 执行路径。
+ *
+ * `runtime` 留在 main：Worker 用剔除 CUA 凭据后的环境启动，workerData 里没有 socket/token，能力通道是
+ * 启动后经 parentPort 转移的 MessagePort。同进程嵌入与测试可直接用
+ * `createInProcessNodeReplExecutor` 注入。
+ */
+export async function executeJsInWorker(
+  input: NodeReplExecuteInput,
+  runtime?: ComputerUseRuntime,
+): Promise<NodeReplRunResult> {
   if (input.signal.aborted) throw input.signal.reason;
   const data: WorkerCallData = {
     code: input.code,
     kind: WORKER_KIND,
     requestMeta: input.requestMeta,
     syncTimeoutMs: input.syncTimeoutMs,
-    cuaBroker: input.cuaBroker,
   };
-  const worker = new Worker(new URL(import.meta.url), { workerData: data });
+  const worker = new Worker(new URL(import.meta.url), {
+    env: createWorkerEnv(),
+    workerData: data,
+  });
+  // 端口不放在 workerData，必须在 Worker 起来后经 parentPort 转移；无论有没有 runtime 都发
+  // 一条消息，让 Worker 有一个确定的「可以开始执行」信号，避免端口与首段代码的启动竞态。
+  const channel = runtime ? new MessageChannel() : undefined;
+  const capability =
+    channel && runtime
+      ? serveNodeReplCuaCapabilityPort({ port: channel.port1, runtime })
+      : undefined;
   return await new Promise<NodeReplRunResult>((resolveRun, rejectRun) => {
     let settled = false;
     const cleanup = () => {
       input.signal.removeEventListener("abort", onAbort);
       worker.removeAllListeners();
+      capability?.close();
+      channel?.port1.close();
     };
     const finish = (error?: unknown, result?: NodeReplRunResult) => {
       if (settled) return;
@@ -283,8 +342,31 @@ async function executeJsInWorker(input: NodeReplExecuteInput): Promise<NodeReplR
       if (!settled)
         finish(new Error(`node_repl worker exited before returning a result (${code})`));
     });
+    if (channel) {
+      // 端口必须在 Worker 起来后经 parentPort 转移：写进 workerData 等于把 capability
+      // 重新变成模型能序列化读的 worker 数据。
+      deliverCapability(worker, channel.port2, NODE_REPL_CUA_CAPABILITY_PORT);
+    } else {
+      deliverCapability(worker, null, NODE_REPL_CUA_CAPABILITY_READY);
+    }
     if (input.signal.aborted) onAbort();
   });
+}
+
+/**
+ * Worker 启动消息也是它的启动门：没有这条消息，Worker 不会执行首段代码。
+ * 因此 postMessage 失败必须走 finish（Worker 不会回报结果，只能 terminate）。
+ */
+function deliverCapability(
+  worker: Worker,
+  port: MessagePort | null,
+  kind: string,
+): void {
+  try {
+    worker.postMessage({ kind, port }, port ? [port] : []);
+  } catch (error) {
+    worker.emit("error", error instanceof Error ? error : new Error(String(error)));
+  }
 }
 
 function parseToolInput<T>(schema: z.ZodType<T>, input: unknown, toolName: string): T {
@@ -350,23 +432,45 @@ export async function main(): Promise<void> {
 if (!isMainThread && isWorkerCallData(workerData)) {
   const execute = createInProcessNodeReplExecutor();
   const controller = new AbortController();
-  void execute({
-    code: workerData.code,
-    requestMeta: workerData.requestMeta,
-    signal: controller.signal,
-    syncTimeoutMs: workerData.syncTimeoutMs,
-    cuaBroker: workerData.cuaBroker,
-  })
-    .then((result) => parentPort?.postMessage(result))
-    .catch((error) => {
-      parentPort?.postMessage({
-        logs: "",
-        error: {
-          name: error instanceof Error ? error.name : "Error",
-          message: error instanceof Error ? error.message : String(error),
-        },
-      } satisfies NodeReplRunResult);
-    });
+  // capability 端口只在 Worker 启动后经 parentPort 收到；到达前 bridge 调用一律 unavailable。
+  let capability: (NodeReplCuaCapabilityClient & { close(): void }) | undefined;
+  const finish = (result: NodeReplRunResult) => {
+    capability?.close();
+    parentPort?.postMessage(result);
+  };
+  const run = (): void => {
+    void execute({
+      code: workerData.code,
+      requestMeta: workerData.requestMeta,
+      signal: controller.signal,
+      syncTimeoutMs: workerData.syncTimeoutMs,
+      cuaCapability: capability,
+    }).then(finish, (error: unknown) => finish(toWorkerErrorResult(error)));
+  };
+  parentPort?.once("message", (message: unknown) => {
+    const port = readTransferredCapabilityPort(message);
+    if (port) capability = createNodeReplCuaCapabilityClient(port);
+    run();
+  });
+}
+
+/** 转移过来的端口不能被伪造成普通对象：只认真有 postMessage 的 MessagePort。 */
+function readTransferredCapabilityPort(message: unknown): MessagePort | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const payload = message as { kind?: unknown; port?: unknown };
+  if (payload.kind !== NODE_REPL_CUA_CAPABILITY_PORT) return undefined;
+  const port = payload.port as MessagePort | undefined;
+  return port && typeof port.postMessage === "function" ? port : undefined;
+}
+
+function toWorkerErrorResult(error: unknown): NodeReplRunResult {
+  return {
+    logs: "",
+    error: {
+      name: error instanceof Error ? error.name : "Error",
+      message: error instanceof Error ? error.message : String(error),
+    },
+  };
 }
 
 export function captureComputerUseRuntimeFromEnvironment(

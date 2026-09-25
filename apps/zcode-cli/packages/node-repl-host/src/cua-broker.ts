@@ -1,14 +1,21 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { rm } from "node:fs/promises";
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Socket } from "node:net";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MessagePort } from "node:worker_threads";
 import type {
   ComputerUseRuntime,
   ComputerUseRuntimeContext,
 } from "@zcode/zcode-cua";
 import type { Logger } from "@zcode/contracts";
-import type { NodeReplCuaBrokerConnection } from "./cua-bridge.js";
+import { readResponseMeta } from "./cua-bridge.js";
+import type {
+  NodeReplCuaBrokerConnection,
+  NodeReplCuaCapabilityRequest,
+  NodeReplCuaCapabilityResponse,
+} from "./cua-bridge.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -59,6 +66,86 @@ export function createNodeReplCuaBroker(input: {
       }
       if (input.platform !== "win32") await rm(socketPath, { force: true });
     },
+  };
+}
+
+/**
+ * main 侧的私有 capability 端口：Worker 只发 `{id, method, input, context}`，runtime 调用与
+ * Helper 凭据都留在这里。端口随一次 cell 的生命周期存在，close() 后不再应答。
+ */
+export function serveNodeReplCuaCapabilityPort(input: {
+  port: MessagePort;
+  runtime: ComputerUseRuntime;
+  logger?: Logger;
+}): { close(): void } {
+  const inFlight = new Set<AbortController>();
+  let closed = false;
+  const onMessage = (message: unknown) => {
+    if (closed) return;
+    const request = readCapabilityRequest(message);
+    if (!request) return;
+    const controller = new AbortController();
+    inFlight.add(controller);
+    void (async () => {
+      let response: NodeReplCuaCapabilityResponse;
+      try {
+        const result = await input.runtime.execute({
+          toolName: request.method,
+          arguments: request.input,
+          context: parseContext(request.context),
+          signal: controller.signal,
+        });
+        response = readCapabilityResult(request.id, result);
+      } catch (error) {
+        response = {
+          id: request.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        inFlight.delete(controller);
+      }
+      if (closed) return;
+      input.port.postMessage(response);
+    })().catch((error: unknown) => {
+      input.logger?.warn("Node REPL CUA capability request failed", {
+        event: "node_repl.cua_capability.request.failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  };
+  input.port.on("message", onMessage);
+  return {
+    close: () => {
+      if (closed) return;
+      closed = true;
+      for (const controller of inFlight) controller.abort();
+      inFlight.clear();
+      input.port.off("message", onMessage);
+      input.port.close();
+    },
+  };
+}
+
+function readCapabilityRequest(value: unknown): NodeReplCuaCapabilityRequest | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const payload = value as Partial<NodeReplCuaCapabilityRequest>;
+  if (typeof payload.id !== "string" || !payload.id) return undefined;
+  if (typeof payload.method !== "string" || !payload.method) return undefined;
+  const context = payload.context ?? {};
+  return { id: payload.id, method: payload.method, input: payload.input, context };
+}
+
+function readCapabilityResult(id: string, result: unknown): NodeReplCuaCapabilityResponse {
+  if (!result || typeof result !== "object") {
+    return { id, ok: false, error: "Computer Use runtime returned no result" };
+  }
+  const responseMeta = readResponseMeta((result as { responseMeta?: unknown }).responseMeta);
+  return {
+    id,
+    ok: true,
+    result: result as CallToolResult,
+    ...(responseMeta ? { responseMeta } : {}),
   };
 }
 

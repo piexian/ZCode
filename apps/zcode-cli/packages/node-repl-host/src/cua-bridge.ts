@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
+import type { MessagePort } from "node:worker_threads";
 import type { NodeReplCuaAppIdentity, NodeReplRequestMeta, NodeReplSession } from "@zcode/core";
 import { CUA_APP_ASSOCIATIONS_META_KEY } from "@zcode/zcode-cua/host-display-contract";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 export const NODE_REPL_CUA_BRIDGE_SYMBOL = Symbol.for("zcode.node-repl.computer-use-bridge");
+/** main→Worker 私有 capability 通道的端口名；只在 worker 启动后经 parentPort 投递。 */
+export const NODE_REPL_CUA_CAPABILITY_PORT = "zcode.node-repl.computer-use-capability-port";
+/** 本次 cell 没有 CUA runtime 时 main 发的那条空投递，给 Worker 一个确定的启动信号。 */
+export const NODE_REPL_CUA_CAPABILITY_READY = "zcode.node-repl.computer-use-capability-ready";
 export const CUA_UNAVAILABLE_IN_SUBAGENT_MESSAGE = "Computer Use is not available in subagent";
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
@@ -14,9 +19,37 @@ export interface ActiveCuaNodeReplCall {
   signal: AbortSignal;
 }
 
+/**
+ * 旧的本进程 broker 凭据连接。
+ *
+ * 生产 Worker 路径已不再使用它（见 `specs/computer-use/windows-runtime.md` 的
+ * migration boundary #1）：Worker 只拿 MessagePort，runtime 调用留在 main。这里保留类型只是为了
+ * 不打断同进程嵌入与旧 bundle 的 source 兼容。
+ */
 export interface NodeReplCuaBrokerConnection {
   socketPath: string;
   token: string;
+}
+
+/** Worker 侧发往 main 的 capability 请求：不含任何 socket/token，只带方法与参数。 */
+export interface NodeReplCuaCapabilityRequest {
+  id: string;
+  method: string;
+  input: unknown;
+  context: Record<string, unknown>;
+}
+
+/** main 侧回给 Worker 的应答；`responseMeta` 仍由 Worker 内的 bridge 合入宿主 sink。 */
+export type NodeReplCuaCapabilityResponse =
+  | { id: string; ok: true; result: CallToolResult; responseMeta?: Record<string, unknown> }
+  | { id: string; ok: false; error: string };
+
+/** Worker 侧 bridge 依赖的最小能力面，便于测试注入假端口。 */
+export interface NodeReplCuaCapabilityClient {
+  call(
+    request: NodeReplCuaCapabilityRequest,
+    signal: AbortSignal,
+  ): Promise<NodeReplCuaCapabilityResponse>;
 }
 
 export interface ComputerUseRuntimeBridge {
@@ -27,6 +60,8 @@ export interface ComputerUseRuntimeBridge {
 }
 
 export function createComputerUseBridgeGlobals(input: {
+  capability?: NodeReplCuaCapabilityClient;
+  /** 同进程嵌入/旧 bundle 的兼容通道；生产 Worker 路径只传 capability。 */
   broker?: NodeReplCuaBrokerConnection;
   generation: number;
   getActiveCall: () => ActiveCuaNodeReplCall | undefined;
@@ -45,7 +80,7 @@ export function createComputerUseBridgeGlobals(input: {
     if (active.requestMeta.runtime_scope === "subagent") {
       throw new Error(CUA_UNAVAILABLE_IN_SUBAGENT_MESSAGE);
     }
-    if (!input.broker) {
+    if (!input.capability && !input.broker) {
       throw new Error("Computer Use is unavailable for this node_repl session");
     }
     return active;
@@ -58,27 +93,123 @@ export function createComputerUseBridgeGlobals(input: {
     },
     call: async (method, methodInput) => {
       const active = assertAvailable();
-      const result = await sendCuaBrokerRequest(
-        input.broker!,
-        {
-          method,
-          input: methodInput,
-          context: requestContext(active.requestMeta),
-        },
-        active.signal,
-      );
+      const context = requestContext(active.requestMeta);
+      const response = input.capability
+        ? await input.capability.call(
+            { id: randomUUID(), method, input: methodInput, context },
+            active.signal,
+          )
+        : await sendCuaBrokerRequest(
+            input.broker!,
+            { method, input: methodInput, context },
+            active.signal,
+          );
       assertActive();
-      if (result.responseMeta) input.session().mergeResponseMeta(result.responseMeta);
+      if (!response.ok) throw new Error(response.error);
+      const result = response.result;
+      if (response.responseMeta) input.session().mergeResponseMeta(response.responseMeta);
       // 目标应用身份必须在这里取：broker 响应是模型看不见也改不了的一跳。等到
       // `projectToHost` 把 `_meta` 交给 `nodeRepl.emitStructuredResult` 就已经落在模型可写的
       // sandbox 通道上，无法再区分「producer 给的」和「cell 里自己写的」。
-      const app = readPrimaryAppIdentity(result.result);
+      const app = readPrimaryAppIdentity(result);
       if (app) input.session().recordCuaAppIdentity(app);
-      return result.result;
+      return result;
     },
   };
 
   return { [NODE_REPL_CUA_BRIDGE_SYMBOL]: bridge };
+}
+
+/**
+ * Worker 侧的 MessagePort capability 客户端。
+ *
+ * 端口由 main 在 Worker 启动后经 parentPort 转移过来，模型既拿不到 socket/token，也无法自己
+ * `new Worker` 重建；abort 立即关闭端口并拒绝在途请求，端口随之从 Worker 的消息循环里摘除。
+ */
+export function createNodeReplCuaCapabilityClient(
+  port: MessagePort,
+): NodeReplCuaCapabilityClient & { close(): void } {
+  let closed = false;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    port.close();
+  };
+  return {
+    close,
+    call: async (request, signal) =>
+      await new Promise<NodeReplCuaCapabilityResponse>((resolve, reject) => {
+        if (closed) {
+          reject(new Error("Computer Use capability channel is closed"));
+          return;
+        }
+        let settled = false;
+        const cleanup = () => {
+          signal.removeEventListener("abort", onAbort);
+          port.off("message", onMessage);
+          port.off("messageerror", onMessageError);
+          port.off("close", onClose);
+        };
+        const settle = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          fn();
+        };
+        const onMessage = (message: unknown) => {
+          const response = readCapabilityResponse(message);
+          if (!response || response.id !== request.id) return;
+          settle(() => (response.ok ? resolve(response) : reject(new Error(response.error))));
+        };
+        const onMessageError = (error: Error) => settle(() => reject(error));
+        const onClose = () =>
+          settle(() => reject(new Error("Computer Use capability channel closed")));
+        const onAbort = () =>
+          settle(() => {
+            close();
+            reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+          });
+        port.on("message", onMessage);
+        port.once("messageerror", onMessageError);
+        port.once("close", onClose);
+        signal.addEventListener("abort", onAbort, { once: true });
+        port.postMessage(request);
+        if (signal.aborted) onAbort();
+      }),
+  };
+}
+
+function readCapabilityResponse(value: unknown): NodeReplCuaCapabilityResponse | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const payload = value as {
+    id?: unknown;
+    ok?: unknown;
+    result?: unknown;
+    error?: unknown;
+    responseMeta?: unknown;
+  };
+  if (typeof payload.id !== "string") return undefined;
+  if (payload.ok === false) {
+    return {
+      id: payload.id,
+      ok: false,
+      error: typeof payload.error === "string" ? payload.error : "Computer Use request failed",
+    };
+  }
+  if (payload.ok !== true || typeof payload.result !== "object" || !payload.result) return undefined;
+  const responseMeta = readResponseMeta(payload.responseMeta);
+  return {
+    id: payload.id,
+    ok: true,
+    result: payload.result as CallToolResult,
+    ...(responseMeta ? { responseMeta } : {}),
+  };
+}
+
+/** responseMeta 只接受普通对象：数组与原始值不构成 host sink 的 meta 形状。 */
+export function readResponseMeta(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
 }
 
 /**
@@ -151,13 +282,13 @@ async function sendCuaBrokerRequest(
   broker: NodeReplCuaBrokerConnection,
   request: { method: string; input: unknown; context: Record<string, unknown> },
   signal: AbortSignal,
-): Promise<{ result: CallToolResult; responseMeta?: Record<string, unknown> }> {
+): Promise<NodeReplCuaCapabilityResponse> {
   const id = randomUUID();
   return await new Promise((resolve, reject) => {
     const socket = createConnection(broker.socketPath);
     let buffer = "";
     let settled = false;
-    const finish = (error?: unknown, value?: { result: CallToolResult; responseMeta?: Record<string, unknown> }) => {
+    const finish = (error?: unknown, value?: NodeReplCuaCapabilityResponse) => {
       if (settled) return;
       settled = true;
       signal.removeEventListener("abort", onAbort);
@@ -171,7 +302,7 @@ async function sendCuaBrokerRequest(
     socket.once("connect", () => {
       socket.write(`${JSON.stringify({ id, token: broker.token, ...request })}\n`);
     });
-    socket.on("data", (chunk) => {
+    socket.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf8");
       if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES) {
         finish(new Error("Computer Use broker response exceeded the 32 MiB limit"));
@@ -188,9 +319,19 @@ async function sendCuaBrokerRequest(
           responseMeta?: Record<string, unknown>;
         };
         if (payload.id !== id) throw new Error("Computer Use broker response id mismatch");
-        if (payload.ok !== true) throw new Error(typeof payload.error === "string" ? payload.error : "Computer Use broker failed");
+        if (payload.ok !== true) {
+          const message =
+            typeof payload.error === "string" ? payload.error : "Computer Use broker failed";
+          finish(new Error(message));
+          return;
+        }
         if (!payload.result) throw new Error("Computer Use broker returned no result");
-        finish(undefined, { result: payload.result, responseMeta: payload.responseMeta });
+        finish(undefined, {
+          id,
+          ok: true,
+          result: payload.result,
+          responseMeta: readResponseMeta(payload.responseMeta),
+        });
       } catch (error) {
         finish(error);
       }
