@@ -11,6 +11,9 @@ mock-cdn/
 packages/desktop/bundled-resources/
 packages/desktop/bundled-agents/
 packages/desktop/bundled-tools/
+# Windows CUA native addon 与 Helper staging 产物（源码在 packages/zcode-cua/native/windows）
+packages/zcode-cua/dist/
+packages/zcode-cua/native/windows/build/
 packages/desktop/mock-cdn/
 *.tsbuildinfo
 .DS_Store
