@@ -96,7 +96,8 @@
     "clean": "node ../../scripts/clean-dist.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src",
-    "lint:fix": "oxlint --write src"
+    "lint:fix": "oxlint --write src",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "3.0.81",

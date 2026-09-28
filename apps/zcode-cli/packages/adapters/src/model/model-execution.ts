@@ -19,12 +19,24 @@ import {
   type ModelRequestAuth,
 } from "@zcode/contracts";
 import type { RegistryProviderConfig } from "@zcode/provider";
-import { withOpenRouterAttributionHeaders } from "@zcode/shared";
+import {
+  buildRuntimeZCodeApiUrl,
+  withOpenRouterAttributionHeaders,
+  ZCODE_VERSION,
+} from "@zcode/shared";
 import { createAnthropicCompatFetch } from "./anthropic-stream-compat.js";
 import { createOpenAIResponsesJsonCompatFetch } from "./openai-responses-json-compat.js";
 import { createModelOptionMapFetch, type RawRequestBodyCapture } from "./model-option-map-fetch.js";
 import { createNetworkProxyFetch } from "../network/proxy-fetch.js";
-import { createOfficialCodingPlanGatewayFetch } from "./official-coding-plan-gateway.js";
+import {
+  createClientRequestSigningV4Fetch,
+  createClientSigningKeyCache,
+  parseClientSigningCredential,
+} from "./client-request-signing.js";
+import {
+  createOfficialCodingPlanGatewayFetch,
+  OFFICIAL_CODING_PLAN_GATEWAY_ROUTES,
+} from "./official-coding-plan-gateway.js";
 import { normalizeModelTlsFailure } from "./failure-tls.js";
 import { mergeModelRequestHeaders } from "./model-request-headers.js";
 
@@ -157,7 +169,10 @@ export class AiSdkModelExecution {
   private readonly network: AiSdkNetworkConfig;
   private readonly logger?: Logger;
   private readonly baseTransport?: ProviderFetch;
+  // 键为 providerId+baseURL+凭据：签名 transport 的构成随凭据变化，见 resolveProviderTransport。
   private readonly providerTransports = new Map<string, ProviderFetch>();
+  // 同一凭据跨 provider 复用一份已解密的私钥，避免每次建连都重新握手。
+  private readonly clientSigningKeyCache = createClientSigningKeyCache();
 
   constructor(config: AiSdkModelExecutionConfig = {}, options: AiSdkModelExecutionOptions = {}) {
     this.env = config.env ?? process.env;
@@ -262,7 +277,7 @@ export class AiSdkModelExecution {
   ): LanguageModelFactory {
     const apiKey = this.resolveApiKey(providerConfig);
     const headers = providerConfig.headers;
-    const providerTransport = this.resolveProviderTransport(providerId);
+    const providerTransport = this.resolveProviderTransport(providerId, providerConfig);
     const fetch = createProviderBusinessErrorFetch({
       fetch: providerTransport,
       providerId,
@@ -321,22 +336,67 @@ export class AiSdkModelExecution {
     return providerConfig.apiKey;
   }
 
-  private resolveProviderTransport(providerId: string): ProviderFetch {
-    const current = this.providerTransports.get(providerId);
+  private resolveProviderTransport(
+    providerId: string,
+    providerConfig: AiSdkProviderConfig,
+  ): ProviderFetch {
+    // zhipu-account 在 bindModel 期不带 API Key（toAiSdkProviderConfig 剔除），
+    // 请求期 resolveRequest 才注入；transport 是否带签名取决于 baseURL+凭据，
+    // 只按 providerId 缓存会把首次的无签名 transport 错误复用给已鉴权请求，
+    // 导致账号模型永远不签名（PR#1 审查 P1）。
+    const cacheKey = `${providerId}\n${providerConfig.baseURL}\n${providerConfig.apiKey ?? ""}`;
+    const current = this.providerTransports.get(cacheKey);
     if (current) {
       return current;
     }
     // 官方 Coding Plan 端点先替换为平台网关端点，再进入用户 HTTP 代理 fetch，
     // httpProxy / noProxy 按实际发送地址判定。
-    const transport = createProviderTransportFetch({
+    const proxyFetch = createProviderProxyFetch({
       caCertFile: this.network.caCertFile,
       env: this.env,
       fetch: this.baseTransport,
       httpProxy: this.network.httpProxy,
       noProxy: this.network.noProxy,
     });
-    this.providerTransports.set(providerId, transport);
+    const transport = this.wrapProviderSigning({
+      providerId,
+      providerConfig,
+      innerFetch: createOfficialCodingPlanGatewayFetch({ env: this.env, fetch: proxyFetch }),
+      // 握手与功能门走最内层出口：它们是 ZCode 平台自身的端点，
+      // 不能被模型网关改写，也不能被 provider 业务错误检测包装。
+      controlFetch: proxyFetch,
+    });
+    this.providerTransports.set(cacheKey, transport);
     return transport;
+  }
+
+  /**
+   * 官方 Coding Plan 端点的请求要带客户端请求签名头，否则上游按未验证调用方处理，
+   * 套餐权益静默失效。签名不绑定 URL，所以签名层放在网关改写之外：
+   * 签名针对用户配置的官方 origin 生成，网关只改投递地址。
+   * 契约见 specs/zcode-client-signing/client-request-signing-v4.md。
+   */
+  private wrapProviderSigning(options: {
+    providerId: string;
+    providerConfig: AiSdkProviderConfig;
+    innerFetch: ProviderFetch;
+    controlFetch: ProviderFetch;
+  }): ProviderFetch {
+    const { providerConfig, innerFetch, controlFetch, providerId } = options;
+    if (!isOfficialSigningTarget(providerConfig.baseURL)) return innerFetch;
+    // 凭据不是 `<id>.<secret>` 形态时等价于不签名；构造期就退出，
+    // 避免把非签名类 provider 的请求变成运行期错误。
+    if (!parseClientSigningCredential(providerConfig.apiKey)) return innerFetch;
+    return createClientRequestSigningV4Fetch({
+      apiKey: providerConfig.apiKey,
+      baseURL: providerConfig.baseURL,
+      clientVersion: ZCODE_VERSION,
+      providerId,
+      fetch: innerFetch,
+      transport: controlFetch,
+      featureGateUrl: buildRuntimeZCodeApiUrl(this.env, FEATURE_GATE_PATH),
+      keyCache: this.clientSigningKeyCache,
+    });
   }
 }
 
@@ -508,16 +568,23 @@ function createProviderProxyFetch(options: ProviderProxyFetchOptions): ProviderF
   return createNetworkProxyFetch(options);
 }
 
+/** 功能门相对 ZCode 平台 origin 的路径。 */
+const FEATURE_GATE_PATH = "/api/v1/agent/configs";
+
 /**
- * 模型请求出口：官方 Coding Plan 端点经 ZCode 平台网关发送（做套餐权益校验等平台侧处理），
- * 其余 provider 直连；之后统一进入用户 HTTP 代理 fetch，httpProxy / noProxy 按实际发送地址判定。
- * 官方端点与网关端点的对应关系见 official-coding-plan-gateway.ts。
+ * 参与客户端请求签名的 origin 集合，与官方端点路由表同源：
+ * 只有官方 Coding Plan 端点才发签名头，用户自建 provider 不受影响。
  */
-function createProviderTransportFetch(options: ProviderProxyFetchOptions): ProviderFetch {
-  return createOfficialCodingPlanGatewayFetch({
-    env: options.env,
-    fetch: createProviderProxyFetch(options),
-  });
+const OFFICIAL_SIGNING_ORIGINS: ReadonlySet<string> = new Set(
+  OFFICIAL_CODING_PLAN_GATEWAY_ROUTES.map((route) => new URL(route.providerEndpoint).origin),
+);
+
+function isOfficialSigningTarget(baseURL: string): boolean {
+  try {
+    return OFFICIAL_SIGNING_ORIGINS.has(new URL(baseURL).origin);
+  } catch {
+    return false;
+  }
 }
 
 async function detectProviderBusinessError(
