@@ -19,7 +19,11 @@ import {
   type ModelRequestAuth,
 } from "@zcode/contracts";
 import type { RegistryProviderConfig } from "@zcode/provider";
-import { buildRuntimeZCodeApiUrl, withOpenRouterAttributionHeaders, ZCODE_VERSION } from "@zcode/shared";
+import {
+  buildRuntimeZCodeApiUrl,
+  withOpenRouterAttributionHeaders,
+  ZCODE_VERSION,
+} from "@zcode/shared";
 import { createAnthropicCompatFetch } from "./anthropic-stream-compat.js";
 import { createOpenAIResponsesJsonCompatFetch } from "./openai-responses-json-compat.js";
 import { createModelOptionMapFetch, type RawRequestBodyCapture } from "./model-option-map-fetch.js";
@@ -165,6 +169,7 @@ export class AiSdkModelExecution {
   private readonly network: AiSdkNetworkConfig;
   private readonly logger?: Logger;
   private readonly baseTransport?: ProviderFetch;
+  // 键为 providerId+baseURL+凭据：签名 transport 的构成随凭据变化，见 resolveProviderTransport。
   private readonly providerTransports = new Map<string, ProviderFetch>();
   // 同一凭据跨 provider 复用一份已解密的私钥，避免每次建连都重新握手。
   private readonly clientSigningKeyCache = createClientSigningKeyCache();
@@ -335,7 +340,12 @@ export class AiSdkModelExecution {
     providerId: string,
     providerConfig: AiSdkProviderConfig,
   ): ProviderFetch {
-    const current = this.providerTransports.get(providerId);
+    // zhipu-account 在 bindModel 期不带 API Key（toAiSdkProviderConfig 剔除），
+    // 请求期 resolveRequest 才注入；transport 是否带签名取决于 baseURL+凭据，
+    // 只按 providerId 缓存会把首次的无签名 transport 错误复用给已鉴权请求，
+    // 导致账号模型永远不签名（PR#1 审查 P1）。
+    const cacheKey = `${providerId}\n${providerConfig.baseURL}\n${providerConfig.apiKey ?? ""}`;
+    const current = this.providerTransports.get(cacheKey);
     if (current) {
       return current;
     }
@@ -356,7 +366,7 @@ export class AiSdkModelExecution {
       // 不能被模型网关改写，也不能被 provider 业务错误检测包装。
       controlFetch: proxyFetch,
     });
-    this.providerTransports.set(providerId, transport);
+    this.providerTransports.set(cacheKey, transport);
     return transport;
   }
 

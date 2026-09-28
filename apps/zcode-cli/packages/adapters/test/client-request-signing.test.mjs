@@ -583,3 +583,53 @@ test("codingPlanSignature 缺失按关闭处理且可缓存", async () => {
   assert.equal(gateCount, 1);
   assert.equal(fake.businessCalls[0].headers.get("X-Client-Sig"), null);
 });
+
+/** 带 body 的非 2xx 响应：记录 cancel 是否传播到底层 stream。 */
+function trackingResponse(status, body = "error") {
+  let cancelled = false;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(textEncoder.encode(body));
+      controller.close();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return { cancelled: () => cancelled, response: new Response(stream, { status }) };
+}
+
+test("失败路径释放响应 body：功能门与握手的非 2xx 不占连接", async () => {
+  const gate = trackingResponse(500);
+  const gateFake = createFakeExit({
+    business: () => new Response("{}", { status: 200 }),
+    gate: () => gate.response,
+    handshake: () => handshakeResponse("unused"),
+  });
+  const gateFetch = signing.createClientRequestSigningV4Fetch({
+    ...modelRequest(),
+    fetch: gateFake.business,
+    transport: gateFake.control,
+  });
+  const gateCall = modelCall();
+  const gateResult = await gateFetch(gateCall.url, gateCall.init);
+  assert.equal(gateResult.status, 200, "门 5xx 降级为无签名");
+  assert.equal(gate.cancelled(), true, "功能门非 2xx 分支必须取消 body（PR#1 审查 P2）");
+
+  const handshake = trackingResponse(503);
+  const handshakeFake = createFakeExit({
+    business: () => new Response("{}", { status: 200 }),
+    gate: () => gateResponse(true),
+    handshake: () => handshake.response,
+  });
+  const handshakeFetch = signing.createClientRequestSigningV4Fetch({
+    ...modelRequest(),
+    fetch: handshakeFake.business,
+    transport: handshakeFake.control,
+  });
+  const handshakeCall = modelCall();
+  const handshakeResult = await handshakeFetch(handshakeCall.url, handshakeCall.init);
+  assert.equal(handshakeResult.status, 200, "握手 503 降级为无签名");
+  assert.equal(handshake.cancelled(), true, "握手非 200 分支必须取消 body（PR#1 审查 P2）");
+  assert.equal(handshakeFake.businessCalls[0].headers.get("X-Client-Sig"), null);
+});

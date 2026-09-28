@@ -98,13 +98,14 @@ digest = sha256("{prefix}\n{nonce}")                              // 命中前�
 
 ## 4. 状态所有者
 
-| 状态                   | 唯一所有者                                   | 生命周期               | 失效行为                              |
-| ---------------------- | -------------------------------------------- | ---------------------- | ------------------------------------- |
-| 私钥与 epoch           | 按 `(apiKey, handshakeUrl)` 缓存的 key state | 进程内，首次握手后常驻 | 401 刷新或 dispose 时清空并递增 epoch |
-| 握手 in-flight promise | 同上                                         | 单次                   | epoch 变化时结果丢弃                  |
-| bypass 标志            | 按 provider 的 signer                        | 进程内                 | 不恢复；新进程重新握手                |
-| 功能门快照             | 每个 signer 一份                             | 3 600 ms               | 过期重查；不可缓存的结果不写快照      |
-| 观察事件               | 调用方注入的 observer                        | 无                     | 抛错不影响请求                        |
+| 状态                    | 唯一所有者                                                             | 生命周期               | 失效行为                                                                  |
+| ----------------------- | ---------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------- |
+| 私钥与 epoch            | 按 `(apiKey, handshakeUrl)` 缓存的 key state                           | 进程内，首次握手后常驻 | 401 刷新或 dispose 时清空并递增 epoch                                     |
+| 握手 in-flight promise  | 同上                                                                   | 单次                   | epoch 变化时结果丢弃                                                      |
+| bypass 标志             | 按 provider 的 signer                                                  | 进程内                 | 不恢复；新进程重新握手                                                    |
+| 功能门快照              | 每个 signer 一份                                                       | 3 600 000 ms           | 过期重查；不可缓存的结果不写快照                                          |
+| provider transport 缓存 | `AiSdkModelExecution.providerTransports`，键为 providerId+baseURL+凭据 | 进程内                 | 凭据变化（含 zhipu-account 请求期注入）生成新条目，不复用无签名 transport |
+| 观察事件                | 调用方注入的 observer                                                  | 无                     | 抛错不影响请求                                                            |
 
 ## 5. 事件顺序
 
@@ -127,7 +128,7 @@ digest = sha256("{prefix}\n{nonce}")                              // 命中前�
   → 其它响应原样返回
 ```
 
-握手与功能门请求走最内层 transport（proxy fetch），不复用网关改写，也不被业务错误检测包装。
+握手与功能门请求走最内层 transport（proxy fetch），不复用网关改写，也不被业务错误检测包装。功能门与握手的非 2xx 响应在返回前必须消费或取消 body：功能门失败不可缓存会反复重试，未释放的 body 会占住 undici 连接。
 
 ## 6. 失败语义
 
@@ -159,6 +160,8 @@ createClientRequestSigningV4Fetch(options: {
 
 `ProviderFetch` 沿用 `adapters/src/model` 既有的 fetch 端口类型，不新增 HTTP 抽象。
 
+实现按职责拆分在 `src/model/client-signing/` 子模块（shared / credential / crypto / feature-gate / handshake / replayable-request / signer），公共入口仍是 `src/model/client-request-signing.ts`，公共导出面不变。
+
 ## 8. 迁移边界
 
 1. 签名 fetch 插在 `resolveProviderTransport` 返回值外层，位于网关改写之上：签名针对用户配置的官方端点 origin 生成，改写只换投递地址。
@@ -175,5 +178,7 @@ createClientRequestSigningV4Fetch(options: {
 5. 401 + `VERIFY_SIGNATURE_INVALID` → 作废私钥、重新握手、再签一次；第二次仍 401 → 后续请求全部无签名。
 6. 重试不叠加旧签名头：同一请求两次发送的 `X-Client-Nonce`、`X-Client-Pow`、`X-Client-Sig` 互不相同。
 7. PoW 解满足前导 8 个零比特且前缀与 `sha256(apiKeyId\nappId\nsessionId\nts)` 一致。
-8. 功能门结果可缓存 3 600 ms；`codingPlanSignature` 缺失按「关」处理且可缓存。
+8. 功能门结果可缓存 3 600 000 ms；`codingPlanSignature` 缺失按「关」处理且可缓存。
 9. 既有 provider 测试与 `pnpm typecheck`、`pnpm lint`、`pnpm architecture:check --changed` 无回归。
+10. transport 缓存区分凭据：zhipu-account 绑定期（无 API Key）与请求期（注入 key）分别得到无签名与带签名 transport，互不串用。
+11. 功能门与握手的非 2xx 分支消费/取消响应 body，连接不泄漏。
